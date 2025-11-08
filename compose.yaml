@@ -1,0 +1,10 @@
+services:
+  smtp-local:
+    build:
+      context: .
+    container_name: smtp-local
+    ports:
+      - published: 2525
+        target: 2525
+        protocol: tcp
+        name: smtp

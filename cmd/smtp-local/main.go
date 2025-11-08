@@ -43,7 +43,6 @@ var (
 	mailDir        string
 	webhookURL     string
 	webhookTimeout time.Duration
-	saveRaw        bool
 )
 
 func init() {
@@ -53,14 +52,15 @@ func init() {
 	flag.DurationVar(&webhookTimeout, "webhook-timeout", 5*time.Second, "HTTP timeout for webhook POST")
 	flag.Parse()
 
-	if saveRaw {
-		if err := os.MkdirAll(mailDir, 0o755); err != nil {
-			log.Fatalf("failed to create maildir: %v", err)
-		}
+	if err := os.MkdirAll(mailDir, 0o755); err != nil {
+		log.Fatalf("failed to create maildir: %v\n", err)
 	}
 }
 
 func main() {
+	log.Printf("saved emails directory: %s\n", mailDir)
+	log.Printf("webhook url: %s\n", webhookURL)
+	log.Printf("webhook timeout: %s\n", webhookTimeout)
 	handler := func(origin net.Addr, from string, to []string, data []byte) error {
 		tstamp := time.Now().Format("2006-01-02-15:04:05.000000000Z07")
 		safeFrom := sanitizeFilename(strings.Trim(from, "<>"))

@@ -1,9 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
+	"mime"
+	"mime/quotedprintable"
 	"net"
+	"net/http"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,37 +23,67 @@ import (
 	"github.com/mhale/smtpd"
 )
 
-var listenPort string
-var mailDir string
+type EmailJSON struct {
+	From        string            `json:"from"`
+	To          []string          `json:"to"`
+	Subject     string            `json:"subject"`
+	Date        string            `json:"date"`
+	MessageID   string            `json:"message_id"`
+	Headers     map[string]string `json:"headers"`
+	Body        string            `json:"body"`
+	BodyPreview string            `json:"body_preview"`
+	SizeBytes   int               `json:"size_bytes"`
+	Filename    string            `json:"filename"`
+	RawBase64   string            `json:"raw_b64"`
+	SHA256Hex   string            `json:"sha256_hex"`
+}
+
+var (
+	listenPort     string
+	mailDir        string
+	webhookURL     string
+	webhookTimeout time.Duration
+	saveRaw        bool
+)
 
 func init() {
-	listenPort = os.Getenv("LISTEN_PORT")
-	if listenPort == "" {
-		listenPort = "2525"
-	}
-	mailDir = os.Getenv("MAIL_DIR")
-	if mailDir == "" {
-		mailDir = "/tmp/mail"
+	flag.StringVar(&listenPort, "listen-port", "2525", "TCP port listen on, e.g. 2525")
+	flag.StringVar(&mailDir, "mail-dir", "/tmp/mail", "Directory to store incoming .eml files")
+	flag.StringVar(&webhookURL, "webhook-url", "", "If set, send each received email as JSON to this webhook via POST")
+	flag.DurationVar(&webhookTimeout, "webhook-timeout", 5*time.Second, "HTTP timeout for webhook POST")
+	flag.Parse()
+
+	if saveRaw {
+		if err := os.MkdirAll(mailDir, 0o755); err != nil {
+			log.Fatalf("failed to create maildir: %v", err)
+		}
 	}
 }
 
 func main() {
-	if err := os.MkdirAll(mailDir, 0o755); err != nil {
-		log.Fatalf("failed to create maildir: %v", err)
-	}
-
 	handler := func(origin net.Addr, from string, to []string, data []byte) error {
-		tstamp := time.Now().Format("2006-01-02-15:04:05.000000000")
-		safeFrom := strings.ReplaceAll(strings.ReplaceAll(from, "<", ""), ">", "")
-		base := fmt.Sprintf("%s_%s_%d.eml", tstamp, sanitizeFilename(safeFrom), os.Getpid())
-		path := filepath.Join(mailDir, base)
-
-		if err := os.WriteFile(path, data, 0o644); err != nil {
+		tstamp := time.Now().Format("2006-01-02-15:04:05.000000000Z07")
+		safeFrom := sanitizeFilename(strings.Trim(from, "<>"))
+		filename := filepath.Join(mailDir, fmt.Sprintf("%s_%s_%d.eml", tstamp, safeFrom, os.Getpid()))
+		if err := os.WriteFile(filename, data, 0o644); err != nil {
 			return fmt.Errorf("save email: %w", err)
 		}
 
-		subject := parseHeader(data, "Subject")
-		log.Printf("Received: from=%q to=%q subject=%q saved=%s", from, strings.Join(to, ", "), subject, path)
+		emailJSON := buildEmailJSON(from, to, data, filename)
+
+		log.Printf("Received mail from=%q to=%q subject=%q saved=%q size=%dB",
+			emailJSON.From, strings.Join(emailJSON.To, ", "),
+			emailJSON.Subject, emailJSON.Filename, emailJSON.SizeBytes)
+
+		if webhookURL != "" {
+			client := &http.Client{Timeout: webhookTimeout}
+			defer client.CloseIdleConnections()
+			if err := postToWebhook(client, webhookURL, emailJSON); err != nil {
+				log.Printf("webhook POST failed: %v", err)
+			} else {
+				log.Printf("webhook POST ok → %s", webhookURL)
+			}
+		}
 		return nil
 	}
 
@@ -61,50 +102,103 @@ func sanitizeFilename(s string) string {
 	return replacer.Replace(s)
 }
 
-// parseHeader extracts a single header value from raw message.
-func parseHeader(data []byte, header string) string {
-	h := header + ":"
-	r := strings.NewReader(string(data))
-	for {
-		line, err := readLine(r)
-		if err != nil {
-			return ""
+func postToWebhook(client *http.Client, url string, payload EmailJSON) error {
+	blob, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal json: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), client.Timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(blob))
+	if err != nil {
+		return fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("non-2xx status: %s, body: %s", resp.Status, string(body))
+	}
+	return nil
+}
+
+func buildEmailJSON(from string, to []string, data []byte, filename string) EmailJSON {
+	msg, err := mail.ReadMessage(bytes.NewReader(data))
+	var (
+		subject   string
+		dateHdr   string
+		messageID string
+		headers   = map[string]string{}
+		bodyText  string
+	)
+	if err == nil && msg != nil {
+		for k, v := range msg.Header {
+			if len(v) > 0 {
+				headers[k] = strings.Join(v, ", ")
+			}
 		}
-		if line == "" { // end of headers
-			return ""
-		}
-		if strings.HasPrefix(strings.ToLower(line), strings.ToLower(h)) {
-			return strings.TrimSpace(line[len(h):])
-		}
+		subject = decodeRFC2047(headers["Subject"])
+		dateHdr = headers["Date"]
+		messageID = headers["Message-ID"]
+
+		rawBody, _ := io.ReadAll(msg.Body)
+		bodyText = decodeBody(msg.Header, rawBody)
+	} else {
+		bodyText = ""
+	}
+
+	sum := sha256.Sum256(data)
+	rawB64 := base64.StdEncoding.EncodeToString(data)
+
+	preview := bodyText
+	if len(preview) > 200 {
+		preview = preview[:200]
+	}
+
+	return EmailJSON{
+		From:        from,
+		To:          to,
+		Subject:     subject,
+		Date:        dateHdr,
+		MessageID:   messageID,
+		Headers:     headers,
+		Body:        bodyText,
+		BodyPreview: preview,
+		SizeBytes:   len(data),
+		Filename:    filename,
+		RawBase64:   rawB64,
+		SHA256Hex:   fmt.Sprintf("%x", sum[:]),
 	}
 }
 
-// readLine reads up to CRLF.
-func readLine(r *strings.Reader) (string, error) {
-	var b strings.Builder
-	for {
-		ch, _, err := r.ReadRune()
-		if err != nil {
-			if b.Len() == 0 {
-				return "", err
-			}
-			return b.String(), nil
-		}
-		if ch == '\r' {
-			// look ahead for '\n'
-			n, _, err2 := r.ReadRune()
-			if err2 == nil && n == '\n' {
-				return b.String(), nil
-			}
-			// if not '\n', push back
-			if err2 == nil {
-				r.UnreadRune()
-			}
-			return b.String(), nil
-		}
-		if ch == '\n' {
-			return b.String(), nil
-		}
-		b.WriteRune(ch)
+func decodeRFC2047(s string) string {
+	if s == "" {
+		return s
 	}
+	dec := new(mime.WordDecoder)
+	decoded, err := dec.DecodeHeader(s)
+	if err != nil {
+		return s
+	}
+	return decoded
+}
+
+func decodeBody(h mail.Header, raw []byte) string {
+	cte := strings.ToLower(strings.TrimSpace(h.Get("Content-Transfer-Encoding")))
+	if cte == "quoted-printable" {
+		qr := quotedprintable.NewReader(bytes.NewReader(raw))
+		b, err := io.ReadAll(qr)
+		if err == nil {
+			raw = b
+		}
+	}
+	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	return text
 }

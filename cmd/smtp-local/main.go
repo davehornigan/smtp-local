@@ -8,18 +8,20 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"mime"
-	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"net/mail"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/jhillyerd/enmime"
 	"github.com/mhale/smtpd"
 )
 
@@ -43,6 +45,7 @@ var (
 	mailDir              string
 	webhookURL           string
 	webhookTimeout       time.Duration
+	maxLengthFromBody    int
 	authRequired         bool
 	authUser             string
 	authPass             string
@@ -54,6 +57,7 @@ func init() {
 	flag.StringVar(&mailDir, "mail-dir", "/tmp/mail", "Directory to store incoming .eml files")
 	flag.StringVar(&webhookURL, "webhook-url", "", "If set, send each received email as JSON to this webhook via POST")
 	flag.DurationVar(&webhookTimeout, "webhook-timeout", 5*time.Second, "HTTP timeout for webhook POST")
+	flag.IntVar(&maxLengthFromBody, "max-body-length", 1024, "Max length of email body")
 
 	flag.BoolVar(&authRequired, "auth-required", false, "Require SMTP AUTH before accepting MAIL/RCPT")
 	flag.StringVar(&authUser, "auth-user", "", "Static username for AUTH (empty means any username is accepted if password matches)")
@@ -174,43 +178,54 @@ func postToWebhook(client *http.Client, url string, payload EmailJSON) error {
 }
 
 func buildEmailJSON(from string, to []string, data []byte, filename string) EmailJSON {
-	msg, err := mail.ReadMessage(bytes.NewReader(data))
-	var (
-		subject   string
-		dateHdr   string
-		messageID string
-		headers   = map[string]string{}
-		bodyText  string
-	)
-	if err == nil && msg != nil {
-		for k, v := range msg.Header {
-			if len(v) > 0 {
-				headers[k] = strings.Join(v, ", ")
-			}
-		}
-		subject = decodeRFC2047(headers["Subject"])
-		dateHdr = headers["Date"]
-		messageID = headers["Message-ID"]
-
-		rawBody, _ := io.ReadAll(msg.Body)
-		bodyText = decodeBody(msg.Header, rawBody)
-	} else {
-		bodyText = ""
-	}
-
 	sum := sha256.Sum256(data)
 	rawB64 := base64.StdEncoding.EncodeToString(data)
 
-	preview := bodyText
-	if len(preview) > 200 {
-		preview = preview[:200]
+	envelope, err := enmime.ReadEnvelope(bytes.NewReader(data))
+	headers := map[string]string{}
+	var subject, dateHeader, messageID string
+	var bodyText, bodyHTML string
+
+	if err == nil && envelope != nil {
+		if envelope.Root != nil {
+			h := mail.Header(envelope.Root.Header)
+			for k, v := range h {
+				if len(v) > 0 {
+					headers[k] = strings.Join(v, ", ")
+				}
+			}
+			subject = decodeRFC2047(headers["Subject"])
+			dateHeader = headers["Date"]
+			messageID = headers["Message-ID"]
+		}
+		bodyText = cleanText(envelope.Text)
+		bodyHTML = strings.TrimSpace(envelope.HTML)
+		if bodyText == "" && bodyHTML != "" {
+			bodyText = htmlToText(bodyHTML)
+		}
+	} else {
+		msg, e2 := mail.ReadMessage(bytes.NewReader(data))
+		if e2 == nil && msg != nil {
+			for k, v := range msg.Header {
+				if len(v) > 0 {
+					headers[k] = strings.Join(v, ", ")
+				}
+			}
+			subject = decodeRFC2047(headers["Subject"])
+			dateHeader = headers["Date"]
+			messageID = headers["Message-ID"]
+			rawBody, _ := io.ReadAll(msg.Body)
+			bodyText = cleanText(string(rawBody))
+		}
 	}
+
+	preview := firstNRunes(bodyText, maxLengthFromBody)
 
 	return EmailJSON{
 		From:        from,
 		To:          to,
 		Subject:     subject,
-		Date:        dateHdr,
+		Date:        dateHeader,
 		MessageID:   messageID,
 		Headers:     headers,
 		Body:        bodyText,
@@ -234,15 +249,49 @@ func decodeRFC2047(s string) string {
 	return decoded
 }
 
-func decodeBody(h mail.Header, raw []byte) string {
-	cte := strings.ToLower(strings.TrimSpace(h.Get("Content-Transfer-Encoding")))
-	if cte == "quoted-printable" {
-		qr := quotedprintable.NewReader(bytes.NewReader(raw))
-		b, err := io.ReadAll(qr)
-		if err == nil {
-			raw = b
-		}
+func cleanText(s string) string {
+	if s == "" {
+		return s
 	}
-	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
-	return text
+	// Decode HTML entities if any slipped here
+	s = html.UnescapeString(s)
+
+	// Normalize CRLF to LF
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+
+	// Remove BOM (UTF-8) and common zero-width spaces
+	// BOM: \uFEFF, ZWSP: \u200B, ZWNJ: \u200C, ZWJ: \u200D, NBSP: \u00A0
+	var scrub = regexp.MustCompile(`[\uFEFF\u200B\u200C\u200D\u00A0]`)
+	s = scrub.ReplaceAllString(s, "")
+
+	return strings.TrimSpace(s)
+}
+
+func htmlToText(in string) string {
+	if in == "" {
+		return in
+	}
+	// Remove script/style
+	rmBlocks := regexp.MustCompile(`(?is)<(script|style)[^>]*>.*?</\1>`)
+	in = rmBlocks.ReplaceAllString(in, "")
+	// Replace <br>, </p>, </div>, </li> with newlines
+	in = regexp.MustCompile(`(?i)<\s*(br|/p|/div|/li)\s*>`).ReplaceAllString(in, "\n")
+	// Strip all tags
+	in = regexp.MustCompile(`(?s)<[^>]+>`).ReplaceAllString(in, "")
+	// Unescape entities
+	in = html.UnescapeString(in)
+	// Collapse multiple newlines
+	in = regexp.MustCompile(`\n{3,}`).ReplaceAllString(in, "\n\n")
+	return cleanText(in)
+}
+
+func firstNRunes(s string, n int) string {
+	if n <= 0 || s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }

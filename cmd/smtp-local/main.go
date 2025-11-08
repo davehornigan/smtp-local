@@ -39,10 +39,14 @@ type EmailJSON struct {
 }
 
 var (
-	listenPort     string
-	mailDir        string
-	webhookURL     string
-	webhookTimeout time.Duration
+	listenPort           string
+	mailDir              string
+	webhookURL           string
+	webhookTimeout       time.Duration
+	authRequired         bool
+	authUser             string
+	authPass             string
+	insecurePlainAllowed bool // advertise PLAIN/LOGIN without TLS (local/testing)
 )
 
 func init() {
@@ -50,6 +54,12 @@ func init() {
 	flag.StringVar(&mailDir, "mail-dir", "/tmp/mail", "Directory to store incoming .eml files")
 	flag.StringVar(&webhookURL, "webhook-url", "", "If set, send each received email as JSON to this webhook via POST")
 	flag.DurationVar(&webhookTimeout, "webhook-timeout", 5*time.Second, "HTTP timeout for webhook POST")
+
+	flag.BoolVar(&authRequired, "auth-required", false, "Require SMTP AUTH before accepting MAIL/RCPT")
+	flag.StringVar(&authUser, "auth-user", "", "Static username for AUTH (empty means any username is accepted if password matches)")
+	flag.StringVar(&authPass, "auth-pass", "", "Static password for AUTH")
+	flag.BoolVar(&insecurePlainAllowed, "auth-allow-insecure-plain", true, "Advertise PLAIN/LOGIN even without TLS (local/testing only)")
+
 	flag.Parse()
 
 	if err := os.MkdirAll(mailDir, 0o755); err != nil {
@@ -87,8 +97,42 @@ func main() {
 		return nil
 	}
 
-	log.Printf("Starting SMTP server on :%s (no TLS, no auth)", listenPort)
-	if err := smtpd.ListenAndServe(":"+listenPort, handler, "SMTP Server", ""); err != nil {
+	var authHandler smtpd.AuthHandler
+	if authRequired || authUser != "" || authPass != "" || insecurePlainAllowed {
+		authHandler = func(_ net.Addr, mechanism string, username, password, _ []byte) (bool, error) {
+			u := string(username)
+			p := string(password)
+
+			// static checks; replace with DB/LDAP/etc if needed
+			if authUser != "" && u != authUser {
+				return false, nil
+			}
+			if authPass != "" && p != authPass {
+				return false, nil
+			}
+			// if no specific creds provided, accept any (for local dev)
+			return true, nil
+		}
+	}
+
+	var mechs map[string]bool
+	if insecurePlainAllowed {
+		mechs = map[string]bool{"PLAIN": true, "LOGIN": true}
+	}
+	srv := &smtpd.Server{
+		Addr:         ":" + listenPort,
+		Hostname:     "localhost",
+		Appname:      "SMTP Server",
+		Handler:      handler,
+		AuthHandler:  authHandler,
+		AuthMechs:    mechs,        // nil = package defaults; here we force PLAIN/LOGIN
+		AuthRequired: authRequired, // if true, require AUTH before MAIL/RCPT
+	}
+
+	log.Printf("Starting SMTP server on %s (host=%s, authRequired=%v, insecurePlain=%v)",
+		srv.Addr, srv.Hostname, authRequired, insecurePlainAllowed)
+
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

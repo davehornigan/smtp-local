@@ -255,15 +255,17 @@ func cleanText(s string) string {
 	}
 	// Decode HTML entities if any slipped here
 	s = html.UnescapeString(s)
-
 	// Normalize CRLF to LF
 	s = strings.ReplaceAll(s, "\r\n", "\n")
-
-	// Remove BOM (UTF-8) and common zero-width spaces
-	// BOM: \uFEFF, ZWSP: \u200B, ZWNJ: \u200C, ZWJ: \u200D, NBSP: \u00A0
-	var scrub = regexp.MustCompile(`[\uFEFF\u200B\u200C\u200D\u00A0]`)
-	s = scrub.ReplaceAllString(s, "")
-
+	// Remove BOM (0xFEFF), ZWSP (0x200B), ZWNJ (0x200C), ZWJ (0x200D), NBSP (0x00A0)
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '\uFEFF', '\u200B', '\u200C', '\u200D', '\u00A0':
+			return -1
+		default:
+			return r
+		}
+	}, s)
 	return strings.TrimSpace(s)
 }
 

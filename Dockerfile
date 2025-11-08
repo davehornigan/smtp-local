@@ -19,4 +19,4 @@ RUN apk add ca-certificates
 WORKDIR /app
 COPY --from=build /app/build/ /app/
 
-CMD ["/app/smtp-local"]
+ENTRYPOINT ["/app/smtp-local"]
